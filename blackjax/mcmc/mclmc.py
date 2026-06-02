@@ -1,0 +1,259 @@
+# Copyright 2020- The Blackjax Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Public API for the MCLMC Kernel"""
+from typing import Callable, NamedTuple
+
+import jax
+import jax.numpy as jnp
+
+from blackjax.base import SamplingAlgorithm, build_sampling_algorithm
+from blackjax.mcmc.integrators import (
+    IntegratorState,
+    isokinetic_mclachlan,
+    with_isokinetic_maruyama,
+)
+from blackjax.types import ArrayLike, PRNGKey
+from blackjax.util import generate_unit_vector, pytree_size
+
+__all__ = ["MCLMCInfo", "init", "build_kernel", "as_top_level_api"]
+
+
+class MCLMCInfo(NamedTuple):
+    """
+    Additional information on the MCLMC transition.
+
+    logdensity
+        The log-density of the distribution at the current step of the MCLMC chain.
+    kinetic_change
+        The difference in kinetic energy between the current and previous step.
+    energy_change
+        The difference in energy between the current and previous step.
+    """
+
+    logdensity: float
+    kinetic_change: float
+    energy_change: float
+    nonans: bool
+
+
+def init(position: ArrayLike, logdensity_fn, rng_key):
+    if pytree_size(position) < 2:
+        raise ValueError(
+            "The target distribution must have more than 1 dimension for MCLMC."
+        )
+    logdensity, logdensity_grad = jax.value_and_grad(logdensity_fn)(position)
+
+    return IntegratorState(
+        position=position,
+        momentum=generate_unit_vector(rng_key, position),
+        logdensity=logdensity,
+        logdensity_grad=logdensity_grad,
+    )
+
+
+def build_kernel(
+    integrator: Callable = isokinetic_mclachlan,
+    desired_energy_var_max_ratio: float = jnp.inf,
+    desired_energy_var: float = 5e-4,
+):
+    """Build an MCLMC kernel.
+
+    Parameters
+    ----------
+    integrator
+        The isokinetic integrator to use.
+    desired_energy_var_max_ratio
+        Maximum ratio of energy variance to desired energy variance before
+        rejecting a transition.
+    desired_energy_var
+        The target energy variance per dimension.
+
+    Returns
+    -------
+    A kernel that takes a rng_key and a Pytree that contains the current state
+    of the chain and that returns a new state of the chain along with
+    information about the transition.
+
+    """
+
+    def kernel(
+        rng_key: PRNGKey,
+        state: IntegratorState,
+        logdensity_fn: Callable,
+        inverse_mass_matrix: ArrayLike,
+        L: float,
+        step_size: float,
+    ) -> tuple[IntegratorState, MCLMCInfo]:
+        step = with_isokinetic_maruyama(
+            integrator(
+                logdensity_fn=logdensity_fn, inverse_mass_matrix=inverse_mass_matrix
+            )
+        )
+
+        kernel_key, energy_cutoff_key, nan_key = jax.random.split(rng_key, 3)
+
+        (position, momentum, logdensity, logdensity_grad), kinetic_change = step(
+            state, step_size, L, kernel_key
+        )
+
+        energy_change = kinetic_change - logdensity + state.logdensity
+        eev_max_per_dim = desired_energy_var_max_ratio * desired_energy_var
+        ndims = pytree_size(position)
+
+        new_state, info = handle_high_energy(
+            state,
+            IntegratorState(position, momentum, logdensity, logdensity_grad),
+            MCLMCInfo(
+                logdensity=logdensity,
+                energy_change=energy_change,
+                kinetic_change=kinetic_change,
+                nonans=True,
+            ),
+            energy_cutoff_key,
+            cutoff=jnp.sqrt(ndims * eev_max_per_dim),
+        )
+
+        new_state, info = handle_nans(state, new_state, info, nan_key)
+
+        return new_state, info
+
+    return kernel
+
+
+def as_top_level_api(
+    logdensity_fn: Callable,
+    L,
+    step_size,
+    integrator=isokinetic_mclachlan,
+    inverse_mass_matrix=1.0,
+    desired_energy_var_max_ratio=jnp.inf,
+) -> SamplingAlgorithm:
+    """The general mclmc kernel builder (:meth:`blackjax.mcmc.mclmc.build_kernel`, alias `blackjax.mclmc.build_kernel`) can be
+    cumbersome to manipulate. Since most users only need to specify the kernel
+    parameters at initialization time, we provide a helper function that
+    specializes the general kernel.
+
+    We also add the general kernel and state generator as an attribute to this class so
+    users only need to pass `blackjax.mclmc` to SMC, adaptation, etc. algorithms.
+
+    Examples
+    --------
+
+    A new mclmc kernel can be initialized and used with the following code:
+
+    .. code::
+
+        mclmc = blackjax.mcmc.mclmc.mclmc(
+            logdensity_fn=logdensity_fn,
+            L=L,
+            step_size=step_size
+        )
+        state = mclmc.init(position)
+        new_state, info = mclmc.step(rng_key, state)
+
+    Kernels are not jit-compiled by default so you will need to do it manually:
+
+    .. code::
+
+        step = jax.jit(mclmc.step)
+        new_state, info = step(rng_key, state)
+
+    Parameters
+    ----------
+    logdensity_fn
+        The log-density function we wish to draw samples from.
+    L
+        the momentum decoherence rate
+    step_size
+        step size of the integrator
+    integrator
+        an integrator. We recommend using the default here.
+
+    Returns
+    -------
+    A ``SamplingAlgorithm``.
+    """
+
+    kernel = build_kernel(
+        integrator=integrator,
+        desired_energy_var_max_ratio=desired_energy_var_max_ratio,
+    )
+    return build_sampling_algorithm(
+        kernel,
+        init,
+        logdensity_fn,
+        kernel_args=(inverse_mass_matrix, L, step_size),
+        pass_rng_key_to_init=True,
+    )
+
+
+def handle_nans(previous_state, next_state, info, key):
+    new_momentum = generate_unit_vector(key, previous_state.position)
+
+    # Make nonans pytree compatible
+    def isfinite_pytree(x):
+        # Recursively check if all leaves in a pytree are finite
+        # Will return True if all are finite, False otherwise
+        leaves, _ = jax.tree.flatten(x)
+        return jnp.all(jnp.stack([jnp.all(jnp.isfinite(leaf)) for leaf in leaves]))
+
+    nonans = jnp.logical_and(
+        isfinite_pytree(next_state.position), isfinite_pytree(next_state.momentum)
+    )
+
+    state, info = jax.lax.cond(
+        nonans,
+        lambda: (next_state, info),
+        lambda: (
+            IntegratorState(
+                previous_state.position,
+                new_momentum,
+                previous_state.logdensity,
+                previous_state.logdensity_grad,
+            ),
+            MCLMCInfo(
+                logdensity=previous_state.logdensity,
+                energy_change=jnp.zeros_like(info.energy_change),
+                kinetic_change=jnp.zeros_like(info.kinetic_change),
+                nonans=nonans,
+            ),
+        ),
+    )
+
+    return state, info
+
+
+def handle_high_energy(previous_state, next_state, info, key, cutoff):
+    new_momentum = generate_unit_vector(key, previous_state.position)
+
+    state, info = jax.lax.cond(
+        jnp.abs(info.energy_change) > cutoff,
+        lambda: (
+            IntegratorState(
+                previous_state.position,
+                new_momentum,
+                previous_state.logdensity,
+                previous_state.logdensity_grad,
+            ),
+            MCLMCInfo(
+                logdensity=previous_state.logdensity,
+                energy_change=jnp.zeros_like(info.energy_change),
+                kinetic_change=jnp.zeros_like(info.kinetic_change),
+                nonans=info.nonans,
+            ),
+        ),
+        lambda: (next_state, info),
+    )
+
+    return state, info

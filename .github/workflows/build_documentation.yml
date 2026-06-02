@@ -1,0 +1,25 @@
+name: Build the documentation
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout the branch
+        uses: actions/checkout@v3
+        with:
+          persist-credentials: false
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build the documentation with Sphinx
+        run: |
+          uv sync --group docs
+          uv run sphinx-build -b html docs docs/build/html
