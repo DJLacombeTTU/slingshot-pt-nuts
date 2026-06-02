@@ -14,7 +14,7 @@ from .adaptation.window_adaptation import window_adaptation
 from .base import SamplingAlgorithm, VIAlgorithm
 from blackjax.mcmc.parallel_tempering import parallel_tempering
 from blackjax.adaptation.parallel_tempering import parallel_tempering_adaptation
-from blackjax.mcmc.slingshot import slingshot_warmup
+from blackjax.mcmc.slingshot import build_kernel as slingshot
 from blackjax.mcmc.sharding import create_thermodynamic_mesh, shard_pytree
 from blackjax.mcmc.pymc_bridge import sample_slingshot
 from blackjax.mcmc.adaptation import (
