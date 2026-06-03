@@ -28,18 +28,18 @@ def parallel_tempering(
 ):
     """Factory that builds a pure, framework-agnostic Parallel Tempering kernel."""
 
+    def one_rung_init(pos, beta_val):
+        """Helper to initialize or rebuild a single rung's inner state."""
+        def local_logdensity(p):
+            return beta_val * logdensity_fn(p)
+        kernel_instance = inner_kernel(local_logdensity, **inner_parameters)
+        return kernel_instance.init(pos)
+
     # -------------------------------------------------------------------------
     # COMPONENT 2: THE STATE INITIALIZATION FUNCTION
     # -------------------------------------------------------------------------
     def init(initial_positions: jax.Array, beta: jax.Array) -> ParallelTemperingState:
         """Initializes the collective state across all temperature rungs."""
-        
-        # Helper function for a single rung to enforce a unary log-density signature
-        def one_rung_init(pos, beta_val):
-            def local_logdensity(p):
-                return beta_val * logdensity_fn(p)
-            kernel_instance = inner_kernel(local_logdensity, **inner_parameters)
-            return kernel_instance.init(pos)
         
         # Vectorize initialization across all temperature rungs simultaneously
         sharded_inner_states = jax.vmap(one_rung_init)(initial_positions, beta)
@@ -65,7 +65,6 @@ def parallel_tempering(
         # --- STAGE 1: LOCAL MUTATION (Parallel Trajectories) ---
         mutation_keys = jax.random.split(key_mutation, num_rungs)
         
-        # Helper function for a single rung mutation step
         def one_rung_step(key, inner_state, beta_val):
             def local_logdensity(p):
                 return beta_val * logdensity_fn(p)
@@ -82,16 +81,15 @@ def parallel_tempering(
         # --- STAGE 2: GLOBAL SWAP (Vectorized Even/Odd Exchange Gates) ---
         key_even, key_odd = jax.random.split(key_swap)
         
-        def execute_swap_phase(rng_key, current_positions, current_logdensities, current_inner, is_even):
+        def execute_swap_phase(rng_key, current_positions, current_logdensities, is_even):
             start_idx = 0 if is_even else 1
             idx_i = jnp.arange(start_idx, num_rungs - 1, 2)
             idx_j = idx_i + 1
             
             # Guard against empty slices
             if idx_i.shape[0] == 0:
-                # Return empty arrays of the correct dimension for the mask/indices
                 empty_mask = jnp.zeros((0,), dtype=bool)
-                return current_positions, current_logdensities, current_inner, empty_mask, idx_i
+                return current_positions, current_logdensities, empty_mask, idx_i
             
             # Extract adjacent pairs
             pos_i, pos_j = current_positions[idx_i], current_positions[idx_j]
@@ -109,7 +107,7 @@ def parallel_tempering(
             # Expand mask dimensions to broadcast cleanly across position arrays
             mask_expanded = jnp.expand_dims(accept_mask, axis=-1)
             
-            # Calculate conditional swaps
+            # Calculate conditional swaps (Only swap coordinates and untempered densities)
             swapped_pos_i = jnp.where(mask_expanded, pos_j, pos_i)
             swapped_pos_j = jnp.where(mask_expanded, pos_i, pos_j)
             
@@ -120,47 +118,28 @@ def parallel_tempering(
             updated_positions = current_positions.at[idx_i].set(swapped_pos_i).at[idx_j].set(swapped_pos_j)
             updated_logdensities = current_logdensities.at[idx_i].set(swapped_log_i).at[idx_j].set(swapped_log_j)
             
-            # Dynamically reshape the boolean mask to broadcast over arbitrary inner kernel leaves
-            def swap_inner_tree(tree_i, tree_j):
-                def leaf_swap(l_i, l_j):
-                    broadcast_shape = [-1] + [1] * (l_i.ndim - 1)
-                    m = accept_mask.reshape(broadcast_shape)
-                    return jnp.where(m, l_j, l_i)
-                
-                swapped_tree_i = jax.tree_util.tree_map(leaf_swap, tree_i, tree_j)
-                swapped_tree_j = jax.tree_util.tree_map(leaf_swap, tree_j, tree_i)
-                return swapped_tree_i, swapped_tree_j
-            
-            # Slice, swap, and re-insert the inner kernel sub-pytrees
-            inner_i = jax.tree_util.tree_map(lambda x: x[idx_i], current_inner)
-            inner_j = jax.tree_util.tree_map(lambda x: x[idx_j], current_inner)
-            new_inner_i, new_inner_j = swap_inner_tree(inner_i, inner_j)
-            
-            updated_inner = jax.tree_util.tree_map(
-                lambda global_arr, arr_i, arr_j: global_arr.at[idx_i].set(arr_i).at[idx_j].set(arr_j),
-                current_inner, new_inner_i, new_inner_j
-            )
-            
-            return updated_positions, updated_logdensities, updated_inner, accept_mask, idx_i
+            return updated_positions, updated_logdensities, accept_mask, idx_i
 
         # Initialize a global array to track which swaps succeeded across all gaps
         global_swap_record = jnp.zeros(num_rungs - 1, dtype=bool)
 
         # Execute Phase 1: Even-indexed rungs swap upward (0 <-> 1, 2 <-> 3)
-        pos_after_even, log_after_even, inner_after_even, mask_even, idx_even = execute_swap_phase(
-            key_even, new_positions, new_base_logdensities, new_inner_states, is_even=True
+        pos_after_even, log_after_even, mask_even, idx_even = execute_swap_phase(
+            key_even, new_positions, new_base_logdensities, is_even=True
         )
         global_swap_record = global_swap_record.at[idx_even].set(mask_even)
         
         # Execute Phase 2: Odd-indexed rungs swap upward (1 <-> 2, 3 <-> 4)
-        final_positions, final_logdensities, final_inner, mask_odd, idx_odd = execute_swap_phase(
-            key_odd, pos_after_even, log_after_even, inner_after_even, is_even=False
+        final_positions, final_logdensities, mask_odd, idx_odd = execute_swap_phase(
+            key_odd, pos_after_even, log_after_even, is_even=False
         )
         if idx_odd.shape[0] > 0:
             global_swap_record = global_swap_record.at[idx_odd].set(mask_odd)
         
-        # Synchronize coordinates inside the final structural inner sampler state
-        final_inner_sampler_state = final_inner._replace(position=final_positions)
+        # --- STAGE 3: THE FIX (Rebuild Inner States) ---
+        # Instead of swapping the stale inner state gradients, we simply rebuild
+        # the inner states from the final agreed-upon positions using each rung's correct beta.
+        final_inner_sampler_state = jax.vmap(one_rung_init)(final_positions, state.beta)
 
         final_state = ParallelTemperingState(
             position=final_positions,
